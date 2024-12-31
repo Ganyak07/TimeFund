@@ -1,5 +1,5 @@
 ;; title: TimeFund
-;; version: 1.0.0
+;; version: 2.0.0
 ;; summary: A time-locked collaborative fund management system
 ;; description: A smart contract that enables multiple participants to pool their STX tokens
 ;;             with time-based release conditions, milestone tracking, and democratic governance.
