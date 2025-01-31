@@ -1,12 +1,11 @@
 ;; title: TimeFund
-;; version: 2.0.0
+;; version: 2.1.0
 ;; summary: A time-locked collaborative fund management system
 ;; description: A smart contract that enables multiple participants to pool their STX tokens
 ;;             with time-based release conditions, milestone tracking, and democratic governance.
-;;             Includes weighted voting and validator verification systems.
+;;             Includes weighted voting, validator verification systems, and emergency recovery.
 
-;; traits
-;; No traits defined yet
+
 
 ;; token definitions
 (define-fungible-token fund-token)
@@ -22,12 +21,17 @@
 (define-constant ERR-LOCK-PERIOD-NOT-MET (err u4))
 (define-constant ERR-ALREADY-VOTED (err u5))
 (define-constant ERR-NO-PARTICIPANT (err u6))
+(define-constant ERR-NO-EMERGENCY (err u7))
+(define-constant ERR-INSUFFICIENT-VOTES (err u8))
 
 ;; data vars
 (define-data-var total-pool uint u0)
 (define-data-var participant-count uint u0)
 (define-data-var release-votes uint u0)
 (define-data-var last-milestone-id uint u0)
+(define-data-var emergency-state bool false)
+(define-data-var emergency-votes uint u0)
+(define-data-var emergency-threshold uint u90) ;; 90% needed for emergency
 
 ;; data maps
 (define-map participants 
@@ -49,21 +53,22 @@
     {active: bool})
 
 ;; public functions
-(define-public (deposit)
-    (let ((deposit-amount (stx-get-balance tx-sender)))
-        (if (>= deposit-amount MIN_DEPOSIT)
-            (begin
-                (try! (stx-transfer? deposit-amount tx-sender (as-contract tx-sender)))
+(define-public (deposit (amount uint))
+    (if (>= amount MIN_DEPOSIT)
+        (begin
+            (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+            ;; Batch state updates to reduce operations
+            (let ((new-voting-power (calculate-voting-power amount)))
                 (map-set participants 
                     {participant: tx-sender}
-                    {amount: deposit-amount,
+                    {amount: amount,
                      join-time: block-height,
-                     voting-power: (calculate-voting-power deposit-amount),
+                     voting-power: new-voting-power,
                      has-voted: false})
-                (var-set total-pool (+ (var-get total-pool) deposit-amount))
-                (var-set participant-count (+ (var-get participant-count) u1))
-                (ok true))
-            ERR-INVALID-AMOUNT)))
+                (var-set total-pool (+ (var-get total-pool) amount))
+                (var-set participant-count (+ (var-get participant-count) u1)))
+            (ok true))
+        ERR-INVALID-AMOUNT))
 
 (define-public (withdraw (amount uint))
     (let ((participant-info (unwrap! (map-get? participants {participant: tx-sender}) 
@@ -92,6 +97,19 @@
                 (ok true))
             ERR-ALREADY-VOTED)))
 
+(define-public (batch-vote-process (milestone-ids (list 10 uint)))
+    (let ((participant-info (unwrap! (map-get? participants {participant: tx-sender}) 
+                                   ERR-NO-PARTICIPANT)))
+        (asserts! (not (get has-voted participant-info)) ERR-ALREADY-VOTED)
+        (asserts! (lock-period-passed (get join-time participant-info)) ERR-LOCK-PERIOD-NOT-MET)
+        (begin
+            (map-set participants
+                {participant: tx-sender}
+                (merge participant-info {has-voted: true}))
+            (var-set release-votes (+ (var-get release-votes) 
+                                    (get voting-power participant-info)))
+            (ok true))))
+
 (define-public (add-milestone (description (string-ascii 256)) 
                             (required-votes uint))
     (let ((new-milestone-id (+ (var-get last-milestone-id) u1)))
@@ -108,19 +126,58 @@
             ERR-NOT-AUTHORIZED)))
 
 (define-public (complete-milestone (milestone-id uint))
-    (let ((milestone (unwrap! (map-get? milestones {milestone-id: milestone-id})
-                             ERR-MILESTONE-NOT-FOUND)))
+    (let (
+        (milestone (unwrap! (map-get? milestones {milestone-id: milestone-id})
+                         ERR-MILESTONE-NOT-FOUND))
+        (current-votes (var-get release-votes))
+        )
+        (asserts! (is-validator tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (>= current-votes (get required-votes milestone)) ERR-INSUFFICIENT-VOTES)
+        (map-set milestones
+            {milestone-id: milestone-id}
+            (merge milestone 
+                  {completed: true,
+                   completion-time: (some block-height)}))
+        (ok true)))
+
+;; Emergency Recovery Functions
+(define-public (initiate-emergency)
+    (let ((participant-info (unwrap! (map-get? participants {participant: tx-sender}) 
+                                   ERR-NO-PARTICIPANT)))
         (if (and
-            (is-validator tx-sender)
-            (>= (var-get release-votes) (get required-votes milestone)))
+            (>= (get voting-power participant-info) u20) ;; Must have significant stake
+            (not (var-get emergency-state)))
             (begin
-                (map-set milestones
-                    {milestone-id: milestone-id}
-                    (merge milestone 
-                          {completed: true,
-                           completion-time: (some block-height)}))
+                (var-set emergency-state true)
+                (var-set emergency-votes (get voting-power participant-info))
                 (ok true))
             ERR-NOT-AUTHORIZED)))
+
+(define-public (vote-emergency)
+    (let ((participant-info (unwrap! (map-get? participants {participant: tx-sender}) 
+                                   ERR-NO-PARTICIPANT)))
+        (if (and 
+            (var-get emergency-state)
+            (not (get has-voted participant-info)))
+            (begin
+                (var-set emergency-votes (+ (var-get emergency-votes) 
+                                          (get voting-power participant-info)))
+                (ok true))
+            ERR-NO-EMERGENCY)))
+
+(define-public (emergency-withdraw)
+    (let ((participant-info (unwrap! (map-get? participants {participant: tx-sender}) 
+                                   ERR-NO-PARTICIPANT)))
+        (if (and
+            (var-get emergency-state)
+            (>= (var-get emergency-votes) (var-get emergency-threshold)))
+            (begin
+                (try! (as-contract (stx-transfer? 
+                    (get amount participant-info)
+                    (as-contract tx-sender) 
+                    tx-sender)))
+                (ok true))
+            ERR-INSUFFICIENT-VOTES)))
 
 ;; read only functions
 (define-read-only (get-participant-info (participant principal))
@@ -138,6 +195,11 @@
 (define-read-only (can-release-funds)
     (>= (var-get release-votes)
         (* (var-get participant-count) VOTE_THRESHOLD)))
+
+(define-read-only (get-emergency-status)
+    {is-active: (var-get emergency-state),
+     current-votes: (var-get emergency-votes),
+     threshold: (var-get emergency-threshold)})
 
 ;; private functions
 (define-private (is-validator (account principal))
